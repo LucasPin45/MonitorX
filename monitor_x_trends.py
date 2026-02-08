@@ -32,7 +32,7 @@ POLITICS_KEYWORDS = [
     "lula", "bolsonaro", "stf", "pt", "pl", "psdb", "psol", "mdb", "pp", "união",
     "eleição", "eleições", "imposto", "reforma", "cpi", "cpmi", "pec", "plp", "mpv",
 ]
-ZANATTA_QUERY = '("Julia Zanatta" OR @julia_zanatta OR "Deputada Zanatta") -is:retweet lang:pt'
+ZANATTA_QUERY = '("Julia Zanatta" OR @apropriajulia OR "Deputada Zanatta") -is:retweet lang:pt'
 
 MAX_TWEETS = int(os.getenv("MAX_TWEETS", "15"))
 MAX_TRENDS = int(os.getenv("MAX_TRENDS", "25"))
@@ -207,3 +207,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

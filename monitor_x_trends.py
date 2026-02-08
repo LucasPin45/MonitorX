@@ -1,3 +1,4 @@
+# monitor_x_mentions.py
 import os
 import json
 import logging
@@ -8,37 +9,43 @@ from pathlib import Path
 import tweepy
 from telegram import Bot
 
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
-TWITTER_API_SECRET = os.getenv("TWITTER_API_SECRET")
-TWITTER_ACCESS_TOKEN = os.getenv("TWITTER_ACCESS_TOKEN")
-TWITTER_ACCESS_SECRET = os.getenv("TWITTER_ACCESS_SECRET")
+# =========================
+# Env vars (required)
+# =========================
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-BRAZIL_WOEID = 23424768
+# =========================
+# Config
+# =========================
+# Conta correta informada por você:
+ZANATTA_HANDLE = "apropriajulia"
 
-POLITICS_KEYWORDS = [
-    "política", "governo", "congresso", "câmara", "senado",
-    "lula", "bolsonaro", "stf", "pt", "pl", "psdb", "psol", "mdb", "pp", "união",
-    "eleição", "eleições", "imposto", "reforma", "cpi", "cpmi", "pec", "plp", "mpv",
-]
+# Query: pega menções explícitas e citações comuns.
+# Observação: remover lang:pt reduz risco de perder tweets sem tag de idioma.
+QUERY = (
+    f'("Julia Zanatta" OR @{ZANATTA_HANDLE} OR "{ZANATTA_HANDLE}" OR "Deputada Zanatta" OR "Dep. Zanatta" OR Zanatta) '
+    "-is:retweet"
+)
 
-# ATUALIZE AQUI com o @ correto
-ZANATTA_QUERY = '("Julia Zanatta" OR @apropriajulia OR "Deputada Zanatta") -is:retweet lang:pt'
+MAX_RESULTS = int(os.getenv("MAX_TWEETS", "20"))  # até 100 por chamada (v2)
+TEXT_TRIM = int(os.getenv("TEXT_TRIM", "220"))    # corta texto p/ mensagem ficar legível
 
-MAX_TWEETS = int(os.getenv("MAX_TWEETS", "15"))
-MAX_TRENDS = int(os.getenv("MAX_TRENDS", "25"))
-STATE_PATH = Path(os.getenv("STATE_PATH", ".cache/monitor_x_state.json"))
+STATE_PATH = Path(os.getenv("STATE_PATH", ".cache/monitor_x_mentions_state.json"))
 
-TELEGRAM_MAX_LEN = 4000
+# Telegram tem limite ~4096; usamos margem.
+TELEGRAM_MAX_LEN = 3900
 
 
 def require_env(name: str, value: str | None) -> None:
@@ -52,7 +59,7 @@ def load_state() -> dict:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except Exception:
             logger.warning("Falha ao ler state; recriando.")
-    return {"last_trends_hash": None, "last_tweet_ids": []}
+    return {"sent_tweet_ids": []}
 
 
 def save_state(state: dict) -> None:
@@ -60,135 +67,112 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def short_hash(items: list[str]) -> str:
-    import hashlib
-    payload = "\n".join(items).encode("utf-8", errors="ignore")
-    return hashlib.sha256(payload).hexdigest()[:16]
-
-
-def trends_v11() -> list[str]:
-    # Trends é v1.1: pode dar 403 dependendo do plano
-    require_env("TWITTER_API_KEY", TWITTER_API_KEY)
-    require_env("TWITTER_API_SECRET", TWITTER_API_SECRET)
-    require_env("TWITTER_ACCESS_TOKEN", TWITTER_ACCESS_TOKEN)
-    require_env("TWITTER_ACCESS_SECRET", TWITTER_ACCESS_SECRET)
-
-    auth = tweepy.OAuth1UserHandler(
-        TWITTER_API_KEY,
-        TWITTER_API_SECRET,
-        TWITTER_ACCESS_TOKEN,
-        TWITTER_ACCESS_SECRET,
-    )
-    api = tweepy.API(auth, wait_on_rate_limit=True)
-    res = api.get_place_trends(BRAZIL_WOEID)
-    names = [t["name"] for t in res[0]["trends"]]
-    return names[:MAX_TRENDS]
-
-
-def filter_political_trends(trends: list[str]) -> list[str]:
-    out = []
-    for tr in trends:
-        tr_low = tr.lower()
-        if any(kw in tr_low for kw in POLITICS_KEYWORDS):
-            out.append(tr)
-    return out
-
-
-def search_zanatta_v2() -> list[dict]:
-    if not TWITTER_BEARER_TOKEN:
-        logger.warning("TWITTER_BEARER_TOKEN não configurado; pulando busca v2.")
-        return []
+def search_mentions() -> list[dict]:
+    """
+    Busca menções recentes via X API v2.
+    Retorna lista de dicts: {id, created_at, text}
+    """
+    require_env("TWITTER_BEARER_TOKEN", TWITTER_BEARER_TOKEN)
 
     client = tweepy.Client(bearer_token=TWITTER_BEARER_TOKEN, wait_on_rate_limit=True)
     resp = client.search_recent_tweets(
-        query=ZANATTA_QUERY,
-        max_results=min(MAX_TWEETS, 100),
+        query=QUERY,
+        max_results=min(MAX_RESULTS, 100),
         tweet_fields=["created_at", "text"],
     )
     data = resp.data or []
-    out = []
+
+    results = []
     for t in data:
-        out.append(
+        results.append(
             {
                 "id": str(t.id),
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "text": t.text or "",
             }
         )
-    return out
+    return results
 
 
-def build_message(political_trends: list[str], tweets: list[dict], state: dict) -> tuple[str, dict]:
-    trends_hash = short_hash(political_trends)
-    trends_changed = (trends_hash != state.get("last_trends_hash"))
+def format_datetime(iso_str: str | None) -> str:
+    if not iso_str:
+        return ""
+    # Mantém simples e legível
+    # Ex: 2026-02-08T02:44:00+00:00 -> 08/02 23:44 (local)
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%d/%m %H:%M")
+    except Exception:
+        return iso_str
 
-    seen_ids = set(state.get("last_tweet_ids", []))
-    new_tweets = [t for t in tweets if t["id"] not in seen_ids]
 
-    new_state = dict(state)
-    new_state["last_trends_hash"] = trends_hash
-    keep_ids = (list(seen_ids) + [t["id"] for t in new_tweets])[-200:]
-    new_state["last_tweet_ids"] = keep_ids
-
+def build_message(new_mentions: list[dict]) -> str:
     ts = datetime.now(timezone.utc).astimezone().strftime("%d/%m/%Y %H:%M")
-    msg = f"📡 Monitor X — {ts}\n\n"
+    msg = f"📡 Monitor X — {ts}\n"
+    msg += f"🗣️ Novas menções: {len(new_mentions)}\n\n"
 
-    if trends_changed and political_trends:
-        msg += "🔥 Trends políticas (BR):\n"
-        for tr in political_trends[:MAX_TRENDS]:
-            msg += f"• {tr}\n"
-    else:
-        msg += "🔥 Trends políticas (BR): indisponível/sem mudança (plano pode bloquear v1.1).\n"
+    # Ordena por created_at (quando existir) para ficar do mais recente pro mais antigo
+    def sort_key(x: dict):
+        return x.get("created_at") or ""
 
-    msg += "\n"
+    new_mentions_sorted = sorted(new_mentions, key=sort_key, reverse=True)
 
-    if new_tweets:
-        msg += "🗣️ Menções recentes à Julia Zanatta (novas):\n"
-        for t in new_tweets[:MAX_TWEETS]:
-            text = (t["text"] or "").replace("\n", " ").strip()
-            if len(text) > 180:
-                text = text[:180].rstrip() + "…"
-            url = f"https://x.com/i/web/status/{t['id']}"
-            msg += f"• {text}\n  🔗 {url}\n"
-    else:
-        msg += "🗣️ Menções à Julia Zanatta: nada novo desde o último envio.\n"
+    for t in new_mentions_sorted:
+        text = (t["text"] or "").replace("\n", " ").strip()
+        if len(text) > TEXT_TRIM:
+            text = text[:TEXT_TRIM].rstrip() + "…"
 
-    if len(msg) > TELEGRAM_MAX_LEN:
-        msg = msg[:TELEGRAM_MAX_LEN - 1] + "…"
+        when = format_datetime(t.get("created_at"))
+        url = f"https://x.com/i/web/status/{t['id']}"
 
-    return msg, new_state
+        line = f"• {when} — {text}\n  🔗 {url}\n\n"
+        if len(msg) + len(line) > TELEGRAM_MAX_LEN:
+            msg += "…\n"
+            break
+        msg += line
+
+    return msg.strip()
 
 
-async def send_telegram(message: str) -> None:
+async def send_telegram(text: str) -> None:
     require_env("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
     require_env("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
 
-def main():
+def main() -> None:
+    # Exige Telegram e Twitter
+    require_env("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+    require_env("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
+    require_env("TWITTER_BEARER_TOKEN", TWITTER_BEARER_TOKEN)
+
     state = load_state()
+    sent_ids = set(state.get("sent_tweet_ids", []))
 
-    political_trends = []
     try:
-        trends = trends_v11()
-        political_trends = filter_political_trends(trends)
+        mentions = search_mentions()
     except Exception as e:
-        logger.exception("Falha ao obter trends v1.1 (normal se plano bloquear): %s", e)
+        logger.exception("Falha ao buscar menções no X: %s", e)
+        return
 
-    tweets = []
-    try:
-        tweets = search_zanatta_v2()
-    except Exception as e:
-        logger.exception("Falha ao buscar tweets v2: %s", e)
+    # Filtra só o que é novo (dedupe)
+    new_mentions = [m for m in mentions if m["id"] not in sent_ids]
 
-    message, new_state = build_message(political_trends, tweets, state)
+    if not new_mentions:
+        logger.info("Sem novidades: não enviando Telegram (anti-flood).")
+        return
 
+    # Atualiza state ANTES de enviar (para evitar duplicar em caso de retry)
+    # Mantém uma janela para não crescer infinito.
+    updated_ids = (list(sent_ids) + [m["id"] for m in new_mentions])[-400:]
+    state["sent_tweet_ids"] = updated_ids
+    save_state(state)
+
+    message = build_message(new_mentions)
     asyncio.run(send_telegram(message))
-
-    save_state(new_state)
-    logger.info("Mensagem enviada de verdade ao Telegram.")
+    logger.info("Enviado ao Telegram: %s novas menções.", len(new_mentions))
 
 
 if __name__ == "__main__":
